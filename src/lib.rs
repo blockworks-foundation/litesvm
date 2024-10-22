@@ -8,7 +8,6 @@ use solana_loader_v4_program::create_program_runtime_environment_v2;
 use solana_program::sysvar::{fees::Fees, recent_blockhashes::RecentBlockhashes};
 use solana_program_runtime::{
     compute_budget::ComputeBudget,
-    compute_budget_processor::{process_compute_budget_instructions, ComputeBudgetLimits},
     invoke_context::BuiltinFunctionWithContext,
     loaded_programs::{LoadProgramMetrics, LoadedProgram, LoadedProgramsForTxBatch},
     log_collector::LogCollector,
@@ -22,7 +21,7 @@ use solana_sdk::{
     epoch_rewards::EpochRewards,
     epoch_schedule::EpochSchedule,
     feature_set::{include_loaded_accounts_data_size_in_fee_calculation, FeatureSet},
-    fee::FeeStructure,
+    fee::{FeeBudgetLimits, FeeStructure},
     hash::Hash,
     message::{Message, VersionedMessage},
     native_loader,
@@ -36,7 +35,7 @@ use solana_sdk::{
     slot_history::SlotHistory,
     stake_history::StakeHistory,
     system_instruction, system_program,
-    sysvar::{last_restart_slot::LastRestartSlot, Sysvar, SysvarId},
+    sysvar::{last_restart_slot::LastRestartSlot, Sysvar},
     transaction::{MessageHash, SanitizedTransaction, TransactionError, VersionedTransaction},
     transaction_context::{ExecutionRecord, IndexOfAccount, TransactionContext},
 };
@@ -220,7 +219,7 @@ impl LiteSVM {
 
     pub fn set_sysvar<T>(&mut self, sysvar: &T)
     where
-        T: Sysvar + SysvarId,
+        T: Sysvar,
     {
         let account = AccountSharedData::new_data(1, &sysvar, &solana_sdk::sysvar::id()).unwrap();
         self.accounts.add_account(T::id(), account).unwrap();
@@ -228,7 +227,7 @@ impl LiteSVM {
 
     pub fn get_sysvar<T>(&self) -> T
     where
-        T: Sysvar + SysvarId,
+        T: Sysvar,
     {
         bincode::deserialize(self.accounts.get_account(&T::id()).unwrap().data()).unwrap()
     }
@@ -297,6 +296,7 @@ impl LiteSVM {
             .unwrap_or_default()
             .slot;
         let mut loaded_program = solana_bpf_loader_program::load_program_from_bytes(
+            false,
             Some(self.log_collector.clone()),
             &mut LoadProgramMetrics::default(),
             account.data(),
@@ -350,7 +350,7 @@ impl LiteSVM {
     ) -> TransactionContext {
         TransactionContext::new(
             accounts,
-            self.get_sysvar(),
+            Some(self.get_sysvar::<Rent>()),
             compute_budget.max_invoke_stack_height,
             compute_budget.max_instruction_trace_length,
         )
@@ -378,7 +378,7 @@ impl LiteSVM {
     fn process_transaction(
         &mut self,
         tx: &SanitizedTransaction,
-        compute_budget_limits: ComputeBudgetLimits,
+        compute_budget_limits: FeeBudgetLimits,
     ) -> (
         Result<(), TransactionError>,
         u64,
@@ -388,7 +388,6 @@ impl LiteSVM {
     ) {
         let compute_budget = self.compute_budget.unwrap_or_else(|| ComputeBudget {
             compute_unit_limit: u64::from(compute_budget_limits.compute_unit_limit),
-            heap_size: compute_budget_limits.updated_heap_bytes,
             ..ComputeBudget::default()
         });
         let blockhash = tx.message().recent_blockhash();
@@ -396,8 +395,10 @@ impl LiteSVM {
         let mut programs_modified_by_tx = LoadedProgramsForTxBatch::new(
             self.accounts.sysvar_cache.get_clock().unwrap().slot,
             self.accounts.programs_cache.environments.clone(),
-            None,
-            0,
+        );
+        let mut global_program_loaded = LoadedProgramsForTxBatch::new(
+            self.accounts.sysvar_cache.get_clock().unwrap().slot,
+            self.accounts.programs_cache.environments.clone(),
         );
         let mut accumulated_consume_units = 0;
         let message = tx.message();
@@ -414,6 +415,7 @@ impl LiteSVM {
             &compute_budget_limits.into(),
             self.feature_set
                 .is_active(&include_loaded_accounts_data_size_in_fee_calculation::id()),
+            false,
         );
         let mut validated_fee_payer = false;
         let mut payer_key = None;
@@ -524,14 +526,17 @@ impl LiteSVM {
             tx.message(),
             &program_indices,
             &mut context,
+            Rent::default(),
             Some(self.log_collector.clone()),
             &self.accounts.programs_cache,
             &mut programs_modified_by_tx,
+            &mut global_program_loaded,
             self.feature_set.clone(),
             compute_budget,
             &mut ExecuteTimings::default(),
             &self.accounts.sysvar_cache,
             *blockhash,
+            0,
             0,
             &mut accumulated_consume_units,
         )
@@ -615,15 +620,9 @@ impl LiteSVM {
         sanitized_tx: SanitizedTransaction,
     ) -> ExecutionResult {
         let instructions = sanitized_tx.message().program_instructions_iter();
-        let compute_budget_limits = match process_compute_budget_instructions(instructions) {
-            Ok(x) => x,
-            Err(e) => {
-                return ExecutionResult {
-                    tx_result: Err(e),
-                    ..Default::default()
-                };
-            }
-        };
+
+        let compute_budget_limits =
+            ComputeBudget::fee_budget_limits(instructions, &FeatureSet::default());
         if self.history.check_transaction(sanitized_tx.signature()) {
             return ExecutionResult {
                 tx_result: Err(TransactionError::AlreadyProcessed),
